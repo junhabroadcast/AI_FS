@@ -67,39 +67,43 @@ def list_devices() -> list[DeckLinkDeviceInfo]:
     return out
 
 
+def _uyvy_to_bgr(raw: np.ndarray, width: int, height: int, row_bytes: int) -> np.ndarray:
+    """8-bit UYVY → BGR. OpenCV 5는 (H,W,2) 입력이 필요."""
+    row = raw.reshape(height, row_bytes)
+    packed = np.ascontiguousarray(row[:, : width * 2].reshape(height, width, 2))
+    return cv2.cvtColor(packed, cv2.COLOR_YUV2BGR_UYVY)
+
+
 def _unpack_v210_to_bgr(raw: np.ndarray, width: int, height: int, row_bytes: int) -> np.ndarray:
-    """v210 → BGR8 (프리뷰용). WFM V210Unpack 로직을 단순화."""
+    """v210 → BGR8 (프리뷰용, 벡터화)."""
+    # 6 pixels / 16 bytes
     y8 = np.empty((height, width), dtype=np.uint8)
     u8 = np.empty((height, width), dtype=np.uint8)
     v8 = np.empty((height, width), dtype=np.uint8)
-
+    words_per_group = 4
     for y in range(height):
-        row = raw[y * row_bytes : (y + 1) * row_bytes]
+        row = np.frombuffer(raw[y * row_bytes : (y + 1) * row_bytes], dtype=np.uint32)
         x = 0
-        o = 0
-        while x + 5 < width and o + 16 <= row_bytes:
-            w0 = int(row[o]) | (int(row[o + 1]) << 8) | (int(row[o + 2]) << 16) | (int(row[o + 3]) << 24)
-            w1 = int(row[o + 4]) | (int(row[o + 5]) << 8) | (int(row[o + 6]) << 16) | (int(row[o + 7]) << 24)
-            w2 = int(row[o + 8]) | (int(row[o + 9]) << 8) | (int(row[o + 10]) << 16) | (int(row[o + 11]) << 24)
-            w3 = int(row[o + 12]) | (int(row[o + 13]) << 8) | (int(row[o + 14]) << 16) | (int(row[o + 15]) << 24)
-
-            cb0, y0, cr0 = w0 & 0x3FF, (w0 >> 10) & 0x3FF, (w0 >> 20) & 0x3FF
-            y1, cb1, y2 = w1 & 0x3FF, (w1 >> 10) & 0x3FF, (w1 >> 20) & 0x3FF
-            cr1, y3, cb2 = w2 & 0x3FF, (w2 >> 10) & 0x3FF, (w2 >> 20) & 0x3FF
-            y4, cr2, y5 = w3 & 0x3FF, (w3 >> 10) & 0x3FF, (w3 >> 20) & 0x3FF
-
-            ys = (y0, y1, y2, y3, y4, y5)
-            us = (cb0, cb0, cb1, cb1, cb2, cb2)
-            vs = (cr0, cr0, cr1, cr1, cr2, cr2)
-            for i in range(6):
-                y8[y, x + i] = ys[i] >> 2
-                u8[y, x + i] = us[i] >> 2
-                v8[y, x + i] = vs[i] >> 2
+        gi = 0
+        while x + 5 < width and gi + words_per_group <= row.size:
+            w0, w1, w2, w3 = row[gi : gi + 4]
+            cb0, y0, cr0 = int(w0) & 0x3FF, (int(w0) >> 10) & 0x3FF, (int(w0) >> 20) & 0x3FF
+            y1, cb1, y2 = int(w1) & 0x3FF, (int(w1) >> 10) & 0x3FF, (int(w1) >> 20) & 0x3FF
+            cr1, y3, cb2 = int(w2) & 0x3FF, (int(w2) >> 10) & 0x3FF, (int(w2) >> 20) & 0x3FF
+            y4, cr2, y5 = int(w3) & 0x3FF, (int(w3) >> 10) & 0x3FF, (int(w3) >> 20) & 0x3FF
+            y8[y, x : x + 6] = np.array([y0, y1, y2, y3, y4, y5], dtype=np.uint16) >> 2
+            u8[y, x : x + 6] = np.array([cb0, cb0, cb1, cb1, cb2, cb2], dtype=np.uint16) >> 2
+            v8[y, x : x + 6] = np.array([cr0, cr0, cr1, cr1, cr2, cr2], dtype=np.uint16) >> 2
             x += 6
-            o += 16
-
-    yuv = cv2.merge([y8, u8, v8])
-    return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+            gi += words_per_group
+    # BT.709 limited → BGR (간단 변환, OpenCV 채널수 이슈 회피)
+    yf = y8.astype(np.float32)
+    uf = u8.astype(np.float32) - 128.0
+    vf = v8.astype(np.float32) - 128.0
+    r = np.clip(yf + 1.5748 * vf, 0, 255)
+    g = np.clip(yf - 0.1873 * uf - 0.4681 * vf, 0, 255)
+    b = np.clip(yf + 1.8556 * uf, 0, 255)
+    return cv2.merge([b, g, r]).astype(np.uint8)
 
 
 class _InputCallback(COMObject):
@@ -195,15 +199,13 @@ class _CaptureWorker:
         self._callback = _InputCallback(self)
         self._input.SetCallback(self._callback)
 
-        # WFM과 동일: 10-bit 우선, 실패 시 8-bit, 그다음 다른 모드
+        # 프리뷰 30fps: 8-bit 우선 (10-bit v210 언팩은 느림)
         attempts = [
-            (api.bmdModeHD1080i5994, api.bmdFormat10BitYUV),
             (api.bmdModeHD1080i5994, api.bmdFormat8BitYUV),
-            (api.bmdModeHD1080p5994, api.bmdFormat10BitYUV),
             (api.bmdModeHD1080p5994, api.bmdFormat8BitYUV),
-            (api.bmdModeHD1080p30, api.bmdFormat10BitYUV),
+            (api.bmdModeHD1080i5994, api.bmdFormat10BitYUV),
+            (api.bmdModeHD1080p5994, api.bmdFormat10BitYUV),
             (api.bmdModeHD1080p30, api.bmdFormat8BitYUV),
-            (api.bmdModeHD720p5994, api.bmdFormat10BitYUV),
             (api.bmdModeHD720p5994, api.bmdFormat8BitYUV),
         ]
         last_err: Exception | None = None
@@ -256,19 +258,18 @@ class _CaptureWorker:
         raw = np.ctypeslib.as_array((comtypes.c_ubyte * (rb * h)).from_address(addr)).copy()
 
         if pf == api.bmdFormat8BitYUV or pf == int(api.bmdFormat8BitYUV):
-            uyvy = raw.reshape(h, rb)[:, : w * 2]
-            bgr = cv2.cvtColor(uyvy, cv2.COLOR_YUV2BGR_UYVY)
+            bgr = _uyvy_to_bgr(raw, w, h, rb)
         elif pf == api.bmdFormat10BitYUV or pf == int(api.bmdFormat10BitYUV):
             bgr = _unpack_v210_to_bgr(raw, w, h, rb)
         elif pf == api.bmdFormat8BitBGRA or pf == int(api.bmdFormat8BitBGRA):
-            bgra = raw.reshape(h, rb)[:, : w * 4].reshape(h, w, 4)
+            bgra = np.ascontiguousarray(raw.reshape(h, rb)[:, : w * 4]).reshape(h, w, 4)
             bgr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
         else:
-            # 알 수 없는 포맷 — 8bit YUV 가정
+            # 알 수 없는 포맷 — rowBytes 보고 UYVY 가정
             if rb >= w * 2:
-                uyvy = raw.reshape(h, rb)[:, : w * 2]
-                bgr = cv2.cvtColor(uyvy, cv2.COLOR_YUV2BGR_UYVY)
+                bgr = _uyvy_to_bgr(raw, w, h, rb)
             else:
+                self.last_error = f"unsupported pixelFormat={pf} {w}x{h} rb={rb}"
                 return
 
         if self.max_width and bgr.shape[1] > self.max_width:

@@ -62,54 +62,40 @@ _FONT_SM = _find_font(18)
 
 
 def overlay(bgr: np.ndarray, result: BrightnessResult, fps: float) -> np.ndarray:
-    """한글 라벨 + 점수 바를 프레임 위에 그린다.
-
-    호출 전에 표시 크기로 줄인 프레임을 넘기는 것을 권장한다.
-    (풀 HD에서 매 프레임 PIL alpha_composite 하면 ~수 fps로 떨어진다.)
-    """
-    # 표시용으로 너무 크면 한번 더 줄여 오버레이 비용을 제한
-    h, w = bgr.shape[:2]
-    max_w = 960
-    work = bgr
-    if w > max_w:
-        nh = max(1, int(h * max_w / w))
-        work = cv2.resize(bgr, (max_w, nh), interpolation=cv2.INTER_AREA)
-
-    rgb = cv2.cvtColor(work, cv2.COLOR_BGR2RGB)
-    img = Image.fromarray(rgb)
-    draw = ImageDraw.Draw(img, "RGBA")
+    """30fps용 경량 오버레이 (OpenCV). 한글 판정은 상태바에 표시."""
+    out = bgr.copy()
+    h, w = out.shape[:2]
     color = _LABEL_BGR[result.label]
-    fill = (color[2], color[1], color[0])
-    lines = [
-        f"{result.korean()}  ({result.label.value})",
-        f"Y 평균 {result.mean_y_pct:.1f}%   중앙 {result.center_y_pct:.1f}%   p95 {result.p95_y_pct:.1f}%",
-        f"score {result.score:+.2f}   AI {result.ai_score:+.2f}   conf {result.confidence:.2f}   {fps:.1f} fps",
-        f"하이라이트 {result.highlight_pct:.1f}%   섀도우 {result.shadow_pct:.1f}%",
-    ]
-    pad = 10
-    line_h = 30
-    box_h = pad * 2 + line_h * len(lines) + 18
-    box_w = min(img.width - 20, 620)
-    # 전체 프레임 alpha_composite 대신 박스만 반투명 사각형
-    draw.rectangle([8, 8, 8 + box_w, 8 + box_h], fill=(0, 0, 0, 160))
-
-    y = 14
-    for i, line in enumerate(lines):
-        font = _FONT if i == 0 else _FONT_SM
-        draw.text((18, y), line, font=font, fill=fill if i == 0 else (230, 230, 230, 255))
-        y += line_h if i == 0 else 24
-
-    bar_y = 8 + box_h - 14
-    bar_x0, bar_x1 = 18, 8 + box_w - 10
-    draw.rectangle([bar_x0, bar_y, bar_x1, bar_y + 8], fill=(50, 50, 50, 255))
-    mid = (bar_x0 + bar_x1) // 2
-    draw.line([mid, bar_y - 2, mid, bar_y + 10], fill=(120, 120, 120, 255), width=1)
-    pos = int(bar_x0 + (result.score + 1) * 0.5 * (bar_x1 - bar_x0))
-    draw.rectangle([bar_x0, bar_y, pos, bar_y + 8], fill=(*fill, 255))
-
-    out = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
-    if work is not bgr and (out.shape[1] != w or out.shape[0] != h):
-        out = cv2.resize(out, (w, h), interpolation=cv2.INTER_LINEAR)
+    box_h, box_w = 78, min(w - 16, 480)
+    x0, y0 = 8, 8
+    roi = out[y0 : y0 + box_h, x0 : x0 + box_w]
+    cv2.addWeighted(roi, 0.40, np.zeros_like(roi), 0.60, 0, roi)
+    cv2.putText(
+        out,
+        f"{result.label.value}",
+        (16, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        out,
+        f"Y {result.mean_y_pct:.1f}%  score {result.score:+.2f}  {fps:.0f}fps",
+        (16, 58),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (230, 230, 230),
+        1,
+        cv2.LINE_AA,
+    )
+    bar_y = y0 + box_h - 12
+    cv2.rectangle(out, (16, bar_y), (x0 + box_w - 8, bar_y + 6), (50, 50, 50), -1)
+    mid = (16 + x0 + box_w - 8) // 2
+    cv2.line(out, (mid, bar_y - 2), (mid, bar_y + 8), (120, 120, 120), 1)
+    pos = int(16 + (result.score + 1) * 0.5 * (box_w - 24))
+    cv2.rectangle(out, (16, bar_y), (max(16, pos), bar_y + 6), color, -1)
     return out
 
 
@@ -176,12 +162,11 @@ class ScreenSource:
 
 
 class DemoSource:
-    """장비 없이 실시간 노출 변화를 보여 주는 합성 소스."""
+    """장비 없이 실시간 노출 변화를 보여 주는 합성 소스 (30fps용 캐시)."""
 
-    def __init__(self, width: int = 960, height: int = 540):
+    def __init__(self, width: int = 854, height: int = 480):
         self.w, self.h = width, height
         self.i = 0
-        # 약 6초 주기로 노출 스윕
         self.levels = [
             ("DARK", -0.55),
             ("UNDER", -0.85),
@@ -191,23 +176,27 @@ class DemoSource:
             ("BLACK", None),
         ]
         self.frames_per = 45  # ~1.5초 @30fps
+        # 레벨별 프레임을 미리 만들어 매프레임 exposure_scene 비용 제거
+        self._cache: dict[str, np.ndarray] = {}
+        for name, exp in self.levels:
+            if name == "BLACK":
+                self._cache[name] = np.zeros((height, width, 3), dtype=np.uint8)
+            else:
+                rgb = exposure_scene(width, height, 0, float(exp))
+                self._cache[name] = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)[:, :, ::-1]
 
     def read(self) -> np.ndarray | None:
         seg = (self.i // self.frames_per) % len(self.levels)
-        name, exp = self.levels[seg]
-        if name == "BLACK":
-            rgb = np.zeros((self.h, self.w, 3), dtype=np.float32)
-        else:
-            rgb = exposure_scene(self.w, self.h, self.i, float(exp))
+        name, _ = self.levels[seg]
         self.i += 1
-        return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)[:, :, ::-1]  # RGB→BGR
+        return self._cache[name].copy()
 
     def release(self) -> None:
         pass
 
 
 def run(source, title: str = "AI FS Live Brightness") -> None:
-    judge = BrightnessJudge(alpha=0.45)
+    judge = BrightnessJudge(alpha=0.55)
     win = title
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, 1280, 720)
@@ -216,30 +205,24 @@ def run(source, title: str = "AI FS Live Brightness") -> None:
     print(" 실시간 밝기 판정 — 창에서 영상이 재생되며 계속 판정합니다")
     if hasattr(source, "name"):
         print(f" 입력: {source.name}")
-    print(" 종료: q 또는 ESC")
+    print(" 목표 30fps  |  종료: q 또는 ESC")
     print("=" * 56)
 
     t0 = time.perf_counter()
     n = 0
     fps = 0.0
     last_print = 0.0
+    target_dt = 1.0 / 30.0
 
     try:
         while True:
+            loop_t0 = time.perf_counter()
             frame = source.read()
             if frame is None:
                 print("입력 종료")
                 break
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            # 판정 속도: 큰 프레임은 축소 분석
-            h, w = rgb.shape[:2]
-            if w > 640:
-                scale = 640 / w
-                small = cv2.resize(rgb, (640, int(h * scale)), interpolation=cv2.INTER_AREA)
-            else:
-                small = rgb
-            result = judge.judge(small)
+            result = judge.judge_bgr_fast(frame, max_width=160)
 
             n += 1
             elapsed = time.perf_counter() - t0
@@ -265,7 +248,9 @@ def run(source, title: str = "AI FS Live Brightness") -> None:
                 )
                 last_print = now
 
-            key = cv2.waitKey(1) & 0xFF
+            spent = time.perf_counter() - loop_t0
+            wait_ms = max(1, int((target_dt - spent) * 1000))
+            key = cv2.waitKey(wait_ms) & 0xFF
             if key in (27, ord("q"), ord("Q")):
                 break
     finally:

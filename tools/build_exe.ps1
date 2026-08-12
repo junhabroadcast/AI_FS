@@ -1,5 +1,5 @@
 # AI FS Monitor exe 빌드 (WFM tools/build.ps1 스타일)
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $Root = Split-Path -Parent $PSScriptRoot
 
 Push-Location $Root

@@ -41,8 +41,8 @@ except Exception:
 APP_TITLE = "AI FS Monitor"
 VIEW_W, VIEW_H = 1120, 630
 TARGET_FPS = 30
-JUDGE_WIDTH = 160  # 대충 판정용 축소 폭
-DISPLAY_MAX_W = 960  # 오버레이/표시용 상한
+JUDGE_WIDTH = 160  # 판정용 축소 폭 (~1ms)
+DISPLAY_MAX_W = 854  # 표시/캡처 상한 (480p급)
 
 
 class MonitorApp:
@@ -53,7 +53,7 @@ class MonitorApp:
         root.geometry(f"{VIEW_W + 24}x{VIEW_H + 130}")
 
         self.source = None
-        self.judge = BrightnessJudge(alpha=0.45)
+        self.judge = BrightnessJudge(alpha=0.55)  # 판정 반응 빠르게
         self._options: list[tuple[str, int | None, str]] = []
         self._photo = None  # GC 방지
         self._fps = 0.0
@@ -227,8 +227,7 @@ class MonitorApp:
 
             no_signal = hasattr(self.source, "has_signal") and not self.source.has_signal
 
-            # 2) 표시 크기로 먼저 줄인 뒤 오버레이 (풀해상도 PIL이 예전의 3fps 병목)
-            self.root.update_idletasks()
+            # 2) 표시 크기로 줄인 뒤 경량 오버레이 (목표 30fps)
             vw = self.view.winfo_width()
             vh = self.view.winfo_height()
             if vw < 64:
@@ -241,13 +240,13 @@ class MonitorApp:
             if nw != frame.shape[1] or nh != frame.shape[0]:
                 disp = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
             else:
-                disp = frame
+                disp = frame.copy()
 
             view = disp if no_signal else overlay(disp, result, self._fps)
 
             img = Image.fromarray(cv2.cvtColor(view, cv2.COLOR_BGR2RGB))
-            self._photo = ImageTk.PhotoImage(img)
-            self.view.config(image=self._photo)
+            self._photo = ImageTk.PhotoImage(image=img)
+            self.view.configure(image=self._photo)
 
             if no_signal:
                 self.status.config(
