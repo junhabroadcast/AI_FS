@@ -29,6 +29,7 @@ if sys.stdout is not None and sys.stdout.encoding and sys.stdout.encoding.lower(
 
 from ai_fs.brightness import BrightnessJudge, BrightnessLabel, BrightnessResult
 from ai_fs.exposure_source import exposure_scene
+from ai_fs.reference_judge import BrightnessDelta, ColorDelta, ReferenceResult
 
 _LABEL_BGR = {
     BrightnessLabel.DARK: (80, 140, 255),
@@ -37,6 +38,15 @@ _LABEL_BGR = {
     BrightnessLabel.BRIGHT: (0, 220, 255),
     BrightnessLabel.OVER: (0, 80, 255),
     BrightnessLabel.BLACK: (160, 160, 160),
+}
+
+_REF_BRIGHT_BGR = {
+    BrightnessDelta.MATCH: (80, 220, 80),
+    BrightnessDelta.BRIGHTER: (0, 220, 255),
+    BrightnessDelta.MUCH_BRIGHTER: (0, 80, 255),
+    BrightnessDelta.DARKER: (80, 140, 255),
+    BrightnessDelta.MUCH_DARKER: (40, 40, 220),
+    BrightnessDelta.NO_REF: (160, 160, 160),
 }
 
 
@@ -96,6 +106,94 @@ def overlay(bgr: np.ndarray, result: BrightnessResult, fps: float) -> np.ndarray
     cv2.line(out, (mid, bar_y - 2), (mid, bar_y + 8), (120, 120, 120), 1)
     pos = int(16 + (result.score + 1) * 0.5 * (box_w - 24))
     cv2.rectangle(out, (16, bar_y), (max(16, pos), bar_y + 6), color, -1)
+    return out
+
+
+def overlay_reference(bgr: np.ndarray, result: ReferenceResult, fps: float) -> np.ndarray:
+    """기준 대비 판정 오버레이. 한글은 상태바에 표시."""
+    out = bgr.copy()
+    h, w = out.shape[:2]
+    box_h, box_w = 92, min(w - 16, 520)
+    x0, y0 = 8, 8
+    roi = out[y0 : y0 + box_h, x0 : x0 + box_w]
+    cv2.addWeighted(roi, 0.40, np.zeros_like(roi), 0.60, 0, roi)
+
+    if not result.has_reference:
+        cv2.putText(
+            out,
+            "NO REFERENCE",
+            (16, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            (160, 160, 160),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            out,
+            f"Capture baseline first   {fps:.0f}fps",
+            (16, 70),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 200, 200),
+            1,
+            cv2.LINE_AA,
+        )
+        return out
+
+    color = _REF_BRIGHT_BGR[result.brightness]
+    bright_txt = {
+        BrightnessDelta.MATCH: "OK",
+        BrightnessDelta.BRIGHTER: "BRIGHTER",
+        BrightnessDelta.MUCH_BRIGHTER: "MUCH BRIGHTER",
+        BrightnessDelta.DARKER: "DARKER",
+        BrightnessDelta.MUCH_DARKER: "MUCH DARKER",
+        BrightnessDelta.NO_REF: "NO REF",
+    }[result.brightness]
+    color_txt = "COLOR OK" if result.color == ColorDelta.MATCH else "COLOR SHIFT"
+    color_bgr = (80, 220, 80) if result.color == ColorDelta.MATCH else (0, 140, 255)
+
+    cv2.putText(
+        out,
+        bright_txt,
+        (16, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        out,
+        color_txt,
+        (16, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        color_bgr,
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        out,
+        f"dY {result.dy * 100:+.1f}%  dC {result.dc:.3f}  {fps:.0f}fps",
+        (16, 82),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (230, 230, 230),
+        1,
+        cv2.LINE_AA,
+    )
+    # ΔY 바: 중앙=기준, 오른쪽=밝아짐
+    bar_y = y0 + box_h - 10
+    cv2.rectangle(out, (16, bar_y), (x0 + box_w - 8, bar_y + 6), (50, 50, 50), -1)
+    mid = (16 + x0 + box_w - 8) // 2
+    cv2.line(out, (mid, bar_y - 2), (mid, bar_y + 8), (120, 120, 120), 1)
+    span = box_w - 24
+    # dy ±0.20 → 풀스케일
+    t = float(np.clip(result.dy / 0.20, -1.0, 1.0))
+    pos = int(mid + t * (span * 0.5))
+    x_a, x_b = (mid, pos) if pos >= mid else (pos, mid)
+    cv2.rectangle(out, (x_a, bar_y), (max(x_a + 1, x_b), bar_y + 6), color, -1)
     return out
 
 

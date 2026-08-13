@@ -1,7 +1,8 @@
-r"""AI FS Monitor — WFM 스타일 GUI 실시간 밝기 판정.
+r"""AI FS Monitor — WFM 스타일 GUI 기준 대비 밝기·색 판정.
 
-상단에서 캡처카드(DeckLink 포트)를 선택하고 Start를 누르면
-SDI 영상이 재생되면서 밝기(어둡다/정상/밝다/과다·과소/블랙)를 실시간 판정한다.
+상단에서 캡처카드(DeckLink 포트)를 선택하고 Start를 누른 뒤,
+원하는 시점에 「기준 캡처」하면 그 프레임을 골든으로 두고
+실시간 화면이 더 밝은지/어두운지·색이 틀어졌는지 판정한다.
 
   python ai_fs_monitor.py            # GUI 실행
   python ai_fs_monitor.py --selftest # 자동 검증 후 종료 (빌드 확인용)
@@ -27,8 +28,8 @@ if sys.stdout is not None and sys.stdout.encoding and sys.stdout.encoding.lower(
     except Exception:
         pass
 
-from ai_fs.brightness import BrightnessJudge
-from live_brightness import CameraSource, DemoSource, ScreenSource, overlay
+from ai_fs.reference_judge import ReferenceJudge
+from live_brightness import CameraSource, DemoSource, ScreenSource, overlay_reference
 
 try:
     from ai_fs.decklink_capture import DeckLinkSource, list_devices
@@ -53,9 +54,10 @@ class MonitorApp:
         root.geometry(f"{VIEW_W + 24}x{VIEW_H + 130}")
 
         self.source = None
-        self.judge = BrightnessJudge(alpha=0.55)  # 판정 반응 빠르게
+        self.judge = ReferenceJudge(alpha=0.45, max_width=JUDGE_WIDTH)
         self._options: list[tuple[str, int | None, str]] = []
         self._photo = None  # GC 방지
+        self._last_frame: np.ndarray | None = None
         self._fps = 0.0
         self._fps_n = 0
         self._fps_t0 = time.perf_counter()
@@ -79,16 +81,25 @@ class MonitorApp:
         top.pack(fill="x")
 
         ttk.Label(top, text="Device:").pack(side="left")
-        self.device_combo = ttk.Combobox(top, state="readonly", width=52)
+        self.device_combo = ttk.Combobox(top, state="readonly", width=44)
         self.device_combo.pack(side="left", padx=(6, 8))
 
         self.refresh_btn = ttk.Button(top, text="Refresh", command=self.refresh_devices)
-        self.refresh_btn.pack(side="left", padx=(0, 16))
+        self.refresh_btn.pack(side="left", padx=(0, 12))
 
         self.start_btn = ttk.Button(top, text="Start", command=self.on_start)
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(top, text="Stop", command=self.on_stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=(6, 0))
+        self.stop_btn.pack(side="left", padx=(6, 12))
+
+        self.capture_btn = ttk.Button(
+            top, text="기준 캡처", command=self.on_capture_ref, state="disabled"
+        )
+        self.capture_btn.pack(side="left")
+        self.clear_ref_btn = ttk.Button(
+            top, text="기준 지우기", command=self.on_clear_ref, state="disabled"
+        )
+        self.clear_ref_btn.pack(side="left", padx=(6, 0))
 
         # 영상 뷰
         self.view = tk.Label(self.root, bg="black")
@@ -96,12 +107,24 @@ class MonitorApp:
 
         # 상태바 (WFM 스타일)
         self.status = ttk.Label(
-            self.root, text="Ready — 장치를 선택하고 Start를 누르세요", style="Status.TLabel",
+            self.root,
+            text="Ready — Start 후 「기준 캡처」로 골든 프레임을 지정하세요",
+            style="Status.TLabel",
             padding=(10, 5),
         )
         self.status.pack(fill="x", side="bottom")
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _sync_ref_buttons(self) -> None:
+        if not self._running:
+            self.capture_btn.config(state="disabled")
+            self.clear_ref_btn.config(state="disabled")
+            return
+        self.capture_btn.config(state="normal")
+        self.clear_ref_btn.config(
+            state="normal" if self.judge.has_reference else "disabled"
+        )
 
     # --- 장치 목록 -----------------------------------------------------
     def refresh_devices(self) -> None:
@@ -147,7 +170,7 @@ class MonitorApp:
                     break
         self.device_combo.current(pick)
 
-    # --- Start / Stop --------------------------------------------------
+    # --- Start / Stop / 기준 ------------------------------------------
     def on_start(self) -> None:
         if self._running:
             return
@@ -158,7 +181,6 @@ class MonitorApp:
 
         try:
             if kind == "decklink":
-                # 표시·판정에 풀 HD가 필요 없음 — 캡처 단계에서 줄여 CPU 절약
                 self.source = DeckLinkSource(param, max_width=DISPLAY_MAX_W)
             elif kind == "camera":
                 self.source = CameraSource(param)
@@ -175,6 +197,7 @@ class MonitorApp:
             return
 
         self.judge.reset()
+        self._last_frame = None
         self._running = True
         self._fps_n = 0
         self._fps_t0 = time.perf_counter()
@@ -182,7 +205,8 @@ class MonitorApp:
         self.stop_btn.config(state="normal")
         self.device_combo.config(state="disabled")
         self.refresh_btn.config(state="disabled")
-        self.status.config(text=f"Starting — {name or kind} ...")
+        self._sync_ref_buttons()
+        self.status.config(text=f"Starting — {name or kind}  |  기준을 캡처하세요")
         self._tick()
 
     def on_stop(self) -> None:
@@ -193,11 +217,30 @@ class MonitorApp:
             except Exception:
                 pass
             self.source = None
+        self._last_frame = None
+        self.judge.clear_reference()
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.device_combo.config(state="readonly")
         self.refresh_btn.config(state="normal")
+        self._sync_ref_buttons()
         self.status.config(text="Stopped")
+
+    def on_capture_ref(self) -> None:
+        if not self._running or self._last_frame is None:
+            self.status.config(text="캡처할 프레임이 없습니다. Start 후 잠시 기다려 주세요.")
+            return
+        ref = self.judge.set_reference_bgr(self._last_frame)
+        self._sync_ref_buttons()
+        self.status.config(
+            text=f"기준 저장  |  Y {ref.mean_y * 100:.1f}%  "
+            f"Cb {ref.mean_cb:+.3f}  Cr {ref.mean_cr:+.3f}  — 이제 실시간 대비 판정"
+        )
+
+    def on_clear_ref(self) -> None:
+        self.judge.clear_reference()
+        self._sync_ref_buttons()
+        self.status.config(text="기준 삭제  |  다시 「기준 캡처」하세요")
 
     def on_close(self) -> None:
         self.on_stop()
@@ -215,8 +258,8 @@ class MonitorApp:
                 self.on_stop()
                 return
 
-            # 1) 대충 판정: 아주 작은 BGR에서 Y 통계만 (풀 float RGB 변환 없음)
-            result = self.judge.judge_bgr_fast(frame, max_width=JUDGE_WIDTH)
+            self._last_frame = frame
+            result = self.judge.judge_bgr(frame)
 
             self._fps_n += 1
             elapsed_fps = time.perf_counter() - self._fps_t0
@@ -227,7 +270,6 @@ class MonitorApp:
 
             no_signal = hasattr(self.source, "has_signal") and not self.source.has_signal
 
-            # 2) 표시 크기로 줄인 뒤 경량 오버레이 (목표 30fps)
             vw = self.view.winfo_width()
             vh = self.view.winfo_height()
             if vw < 64:
@@ -242,7 +284,7 @@ class MonitorApp:
             else:
                 disp = frame.copy()
 
-            view = disp if no_signal else overlay(disp, result, self._fps)
+            view = disp if no_signal else overlay_reference(disp, result, self._fps)
 
             img = Image.fromarray(cv2.cvtColor(view, cv2.COLOR_BGR2RGB))
             self._photo = ImageTk.PhotoImage(image=img)
@@ -257,23 +299,21 @@ class MonitorApp:
                 sig = ""
                 if hasattr(self.source, "has_signal"):
                     mode = getattr(self.source, "mode_name", "") or ""
-                    sig = f"LOCKED {mode}" if self.source.has_signal else ""
+                    sig = f"LOCKED {mode}  |  " if self.source.has_signal else ""
                 self.status.config(
-                    text=f"{sig}   |   판정: {result.korean()} ({result.label.value})   |   "
-                    f"Y {result.mean_y_pct:.1f}%   score {result.score:+.2f}   |   {self._fps:.1f} fps"
+                    text=f"{sig}기준 대비  |  {result.status_line()}  |  {self._fps:.1f} fps"
                 )
         except Exception as e:
             self.status.config(text=f"표시 오류: {e}")
             _log_crash(e)
 
-        # 목표 30fps: 작업이 빨리 끝나면 남은 시간만큼 쉬고, 늦으면 즉시 다음 틱
         spent_ms = (time.perf_counter() - t0) * 1000.0
         delay = max(1, int(round(1000.0 / TARGET_FPS - spent_ms)))
         self.root.after(delay, self._tick)
 
 
 def selftest() -> int:
-    """빌드/동작 자동 검증: Demo 소스 2초 실행 후 마커 파일 기록."""
+    """빌드/동작 자동 검증: Demo 소스에서 기준 캡처 후 판정까지 확인."""
     out_dir = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "output")
     os.makedirs(out_dir, exist_ok=True)
     marker = os.path.join(out_dir, "selftest_ok.txt")
@@ -282,19 +322,21 @@ def selftest() -> int:
 
     root = tk.Tk()
     app = MonitorApp(root)
-    # Demo 소스 강제 선택 후 시작
     for i, (kind, _, _) in enumerate(app._options):
         if kind == "demo":
             app.device_combo.current(i)
             break
     app.on_start()
 
-    result = {"frames": 0}
+    result = {"frames": 0, "captured": False}
 
     def check() -> None:
         if app._photo is not None:
             result["frames"] += 1
-        if result["frames"] >= 10:
+        if result["frames"] >= 5 and not result["captured"] and app._last_frame is not None:
+            app.on_capture_ref()
+            result["captured"] = True
+        if result["frames"] >= 12 and result["captured"] and app.judge.has_reference:
             dl = "no-decklink"
             if HAVE_DECKLINK:
                 try:
@@ -307,11 +349,13 @@ def selftest() -> int:
                 f.write(f"selftest ok, frames={result['frames']}, status={app.status.cget('text')}\n")
                 f.write(f"decklink: {dl}\n")
             app.on_close()
-        else:
+        elif result["frames"] < 40:
             root.after(100, check)
+        else:
+            app.on_close()
 
     root.after(300, check)
-    root.after(15000, app.on_close)  # 안전 타임아웃
+    root.after(15000, app.on_close)
     root.mainloop()
     return 0 if os.path.exists(marker) else 1
 

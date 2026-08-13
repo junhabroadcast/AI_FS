@@ -2,9 +2,10 @@
 
 2단 구조:
   1) 통계 엔진 — mean/median/p95 Y, 하이라이트·섀도우 클리핑, 중앙 ROI
-  2) 경량 AI   — 동일 피처를 로지스틱 회귀로 점수화 (합성 데이터로 캘리브레이션)
+  2) 경량 AI   — 동일 피처를 로지스틱 회귀로 점수화
 
-DeckLink로 SDI를 받아 오면 프레임 RGB/Y만 넘기면 실시간 판정 가능.
+실방송처럼 '전체는 밝은데 중앙만 어두운' 장면을 DARK로 오인하지 않도록
+어둡다 판정은 평균 Y를 우선한다.
 """
 
 from __future__ import annotations
@@ -85,10 +86,7 @@ def extract_features(rgb: np.ndarray, colorimetry: str = "BT709") -> BrightnessF
 
 
 def extract_features_fast_bgr(bgr: np.ndarray, max_width: int = 160) -> BrightnessFeatures:
-    """실시간용 대충 판정 — 작은 BGR에서 근사 Y만 보고 통계.
-
-    풀프레임 float 변환·median/percentile 전체 정렬을 피해서 ~30fps를 노린다.
-    """
+    """실시간용 대충 판정 — 작은 BGR에서 근사 Y만 보고 통계."""
     if bgr.ndim != 3 or bgr.shape[2] < 3:
         raise ValueError("BGR HxWx3 required")
     h, w = bgr.shape[:2]
@@ -96,7 +94,7 @@ def extract_features_fast_bgr(bgr: np.ndarray, max_width: int = 160) -> Brightne
         nh = max(1, int(h * max_width / w))
         bgr = cv2.resize(bgr, (max_width, nh), interpolation=cv2.INTER_AREA)
 
-    # Rec.709 근사 휘도 (uint8 → [0,1]). 색행렬 풀 변환보다 훨씬 싸다.
+    # Rec.709 근사 휘도 (uint8 → [0,1])
     y = (
         0.0722 * bgr[:, :, 0].astype(np.float32)
         + 0.7152 * bgr[:, :, 1].astype(np.float32)
@@ -114,7 +112,6 @@ def _features_from_y(y: np.ndarray, rough: bool = False) -> BrightnessFeatures:
     mean_y = float(flat.mean())
 
     if rough:
-        # 서브샘플로 분위수·중앙값 근사 (정렬 비용 축소)
         step = max(1, flat.size // 2048)
         sample = flat[::step]
         median_y = float(np.median(sample))
@@ -144,31 +141,32 @@ def _features_from_y(y: np.ndarray, rough: bool = False) -> BrightnessFeatures:
 
 
 def rule_classify(f: BrightnessFeatures) -> BrightnessLabel:
-    """방송 QC식 규칙 판정 — 설명 가능한 1차 판정."""
+    """규칙 판정. 어둡다는 평균 Y 우선 (중앙만 어두워도 DARK 금지)."""
     if f.mean_y < 0.03 and f.p95_y < 0.08:
         return BrightnessLabel.BLACK
-    # 과다노출: 하이라이트 깨짐이 뚜렷하고 전체도 밝은 경우
-    if f.highlight_frac > 0.20 or (f.highlight_frac > 0.10 and f.mean_y > 0.68):
+    if f.highlight_frac > 0.18 or (f.highlight_frac > 0.08 and f.mean_y > 0.62):
         return BrightnessLabel.OVER
-    if f.shadow_frac > 0.40 and f.mean_y < 0.18:
+    if f.shadow_frac > 0.45 and f.mean_y < 0.16:
         return BrightnessLabel.UNDER
-    if f.mean_y < 0.12 and f.p95_y < 0.25:
+    if f.mean_y < 0.10 and f.p95_y < 0.22:
         return BrightnessLabel.UNDER
-    if f.center_y > 0.58 or f.mean_y > 0.55:
+    # 밝다: 임계 완화 (실외·하이키)
+    if f.mean_y > 0.48 or f.center_y > 0.50 or f.p95_y > 0.88:
         return BrightnessLabel.BRIGHT
-    if f.center_y < 0.28 or f.mean_y < 0.25:
+    # 어둡다: 평균이 낮을 때만
+    if f.mean_y < 0.22 or (f.mean_y < 0.30 and f.center_y < 0.20 and f.p95_y < 0.55):
         return BrightnessLabel.DARK
     return BrightnessLabel.NORMAL
 
 
-# 합성 노출 스윕으로 lstsq 캘리브레이션한 로지스틱 가중치
+# mean 가중치 양수 — 전체 밝기가 점수에 정방향 반영
 # 피처: [mean, median, p95, center, highlight, shadow, skew]
-# 출력: exposure score ≈ tanh(w·x + b) ∈ (-1, 1)
 _AI_WEIGHTS = np.array(
-    [-7.1731, -1.0079, 0.3385, 10.9931, -1.192, -1.132, -0.6695],
+    [4.80, 1.20, 1.60, 2.40, 2.20, -2.80, 0.25],
     dtype=np.float64,
 )
-_AI_BIAS = -1.5148
+# mean≈0.40에서 점수≈0이 되도록 (이전 -3.10은 정상도 밝다로 밀림)
+_AI_BIAS = -4.05
 
 
 def ai_exposure_score(f: BrightnessFeatures) -> float:
@@ -180,34 +178,40 @@ def ai_exposure_score(f: BrightnessFeatures) -> float:
 def _label_from_score(score: float, f: BrightnessFeatures) -> BrightnessLabel:
     if f.mean_y < 0.03 and f.p95_y < 0.08:
         return BrightnessLabel.BLACK
-    if f.highlight_frac > 0.22 or (score > 0.75 and f.highlight_frac > 0.12):
+    if f.highlight_frac > 0.18 or (score > 0.70 and f.highlight_frac > 0.08):
         return BrightnessLabel.OVER
-    if score < -0.75 and (f.shadow_frac > 0.22 or f.mean_y < 0.12):
+    if score < -0.78 and (f.shadow_frac > 0.25 or f.mean_y < 0.12):
         return BrightnessLabel.UNDER
-    if score > 0.30:
+    # 밝다 쪽 약간 넓게, 어둡다 쪽은 평균 가드
+    if f.mean_y > 0.48 or score > 0.28:
         return BrightnessLabel.BRIGHT
-    if score < -0.30:
+    if score < -0.40 and f.mean_y < 0.28:
         return BrightnessLabel.DARK
     return BrightnessLabel.NORMAL
 
 
 def _fuse(rule: BrightnessLabel, ai_score: float, f: BrightnessFeatures) -> tuple[BrightnessLabel, float, float]:
-    """규칙 + AI 융합. 블랙/과다·과소는 규칙 우선, 일반 구간은 점수 중심."""
+    """규칙 + AI 융합. 평균이 밝은데 DARK면 보정."""
     if rule == BrightnessLabel.BLACK:
         return rule, -1.0, 0.99
 
+    if f.mean_y >= 0.42 and rule in (BrightnessLabel.DARK, BrightnessLabel.UNDER):
+        rule = BrightnessLabel.BRIGHT if f.mean_y >= 0.48 else BrightnessLabel.NORMAL
+    if f.mean_y >= 0.42 and ai_score < 0:
+        ai_score = 0.55 * ai_score + 0.45 * min(0.55, (f.mean_y - 0.35) * 2.5)
+
     ai_label = _label_from_score(ai_score, f)
+    if f.mean_y >= 0.42 and ai_label in (BrightnessLabel.DARK, BrightnessLabel.UNDER):
+        ai_label = BrightnessLabel.BRIGHT if f.mean_y >= 0.48 else BrightnessLabel.NORMAL
 
     if rule in (BrightnessLabel.OVER, BrightnessLabel.UNDER):
         score = 0.65 * ai_score + 0.35 * (0.9 if rule == BrightnessLabel.OVER else -0.9)
         return rule, float(np.clip(score, -1, 1)), 0.9
 
-    # 규칙·AI 일치 → 높은 신뢰도
     if rule == ai_label:
         conf = 0.55 + 0.4 * min(1.0, abs(ai_score) / 0.55)
         return ai_label, ai_score, float(conf)
 
-    # 불일치: 중앙대(정상 근처)에서는 규칙을 더 신뢰
     if abs(ai_score) < 0.35:
         return rule, 0.5 * ai_score, 0.6
 
@@ -216,7 +220,9 @@ def _fuse(rule: BrightnessLabel, ai_score: float, f: BrightnessFeatures) -> tupl
         BrightnessLabel.DARK: -0.45,
         BrightnessLabel.NORMAL: 0.0,
     }.get(rule, 0.0)
-    blended = 0.7 * ai_score + 0.3 * rule_score
+    blended = 0.65 * ai_score + 0.35 * rule_score
+    if f.mean_y >= 0.45:
+        blended = max(blended, 0.15)
     return _label_from_score(blended, f), float(blended), 0.55
 
 
@@ -251,10 +257,21 @@ class BrightnessJudge:
             a = self.alpha
             self._ema_score = (1 - a) * self._ema_score + a * score
 
+        # 평균이 밝으면 EMA가 음수로 남아도 밝기 쪽으로 끌어올림
+        if f.mean_y >= 0.45 and self._ema_score < 0.15:
+            self._ema_score = 0.6 * self._ema_score + 0.4 * 0.35
+
         smooth_label = _label_from_score(self._ema_score, f)
-        # 블랙은 즉시 반영
         if rule == BrightnessLabel.BLACK:
             smooth_label = BrightnessLabel.BLACK
+        elif f.mean_y >= 0.48 and smooth_label in (
+            BrightnessLabel.DARK,
+            BrightnessLabel.UNDER,
+            BrightnessLabel.NORMAL,
+        ):
+            smooth_label = BrightnessLabel.BRIGHT if f.mean_y >= 0.48 else BrightnessLabel.NORMAL
+        elif f.mean_y >= 0.42 and smooth_label in (BrightnessLabel.DARK, BrightnessLabel.UNDER):
+            smooth_label = BrightnessLabel.NORMAL
 
         return BrightnessResult(
             label=smooth_label,

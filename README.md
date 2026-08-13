@@ -1,17 +1,17 @@
 # AI FS — AI Frame Synchronizer
 
-**버전:** v1.0.0
+**버전:** v1.1.0
 
 방송용 FS(Frame Synchronizer) 개념에 **AI 자동화**를 얹은 Windows 프로토타입입니다.  
-Blackmagic DeckLink SDI 입력을 받아 **실시간 밝기 판정**하고, 소프트웨어 데모로는 **프레임 동기·색/밝기 자동 교정·QC**까지 검증합니다.
+Blackmagic DeckLink SDI 입력을 받아, 사용자가 지정한 **기준 프레임**과 비교해 **실시간 밝기·색 이탈**을 판정합니다. 소프트웨어 데모로는 **프레임 동기·색/밝기 자동 교정·QC**까지 검증합니다.
 
 WFM(웨이브폼 모니터) 프로젝트의 BT.601/709 색 행렬·컬러바·스코프 지식을 이어받았습니다.
 
 ## 주요 기능
 
 - **AiFsMonitor GUI / exe** — Device 콤보로 DeckLink 포트 선택, Start/Stop (WFM 스타일)
+- **기준 캡처** — 원하는 시점 프레임을 골든으로 저장 후, 밝아짐/어두워짐·색 틀어짐 판정
 - DeckLink SDI 실시간 캡처 (COM API, MTA 워커 스레드)
-- 밝기 판정: 어둡다 / 정상 / 밝다 / 과다·과소노출 / 블랙 (목표 **30 fps**)
 - Demo / Webcam / Screen 입력 폴백
 - `demo.py` — 프레임 오프셋 검출 + 드리프트 자동 교정 엔드투엔드
 - `demo_brightness.py` — 합성 노출 스윕 정확도 검증
@@ -31,7 +31,7 @@ WFM(웨이브폼 모니터) 프로젝트의 BT.601/709 색 행렬·컬러바·�
 
 1. **WFM / Media Express**에서 같은 포트를 쓰고 있으면 Stop
 2. Device에서 `DeckLink Quad (n) (free)` 선택 → **Start**
-3. 상태바에 `LOCKED …` + 판정 문구가 보이면 정상
+3. 원하는 화면에서 **기준 캡처** → 상태바에 기준 대비 판정이 보이면 정상
 
 빌드:
 
@@ -54,7 +54,7 @@ python live_brightness.py --demo # OpenCV 창 실시간 데모
 
 | 파일 | 설명 |
 |------|------|
-| [features.md](features.md) | v1.0.0 기능 목록 |
+| [features.md](features.md) | v1.1.0 기능 목록 |
 | [notes.md](notes.md) | 구조, 제한, 사용 팁 |
 | [changelog.md](changelog.md) | 변경 이력 |
 
